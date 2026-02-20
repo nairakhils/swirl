@@ -99,8 +99,9 @@ JAX-only flags: `--backend` (`cpu`/`gpu`/`metal`/`cuda`/`auto`), `--precision` (
 
 ## Performance
 
-Output reports **Mzps** (million zone-updates per second) along with per-fold timing breakdowns (WENO kernel, reduction, and total wall time).
+Output reports **Mzps** (million zone-updates per second) along with per-fold timing breakdowns (WENO kernel, reduction, flux divergence, and total wall time).
 
 The CuPy backend uses:
-- **Fused CUDA RawKernels** for WENO5 reconstruction with shared-memory tiling (256 threads/block, 5-cell halo)
+- **Fused WENO5 RawKernels** for spatial reconstruction with shared-memory tiling (256 threads/block, 5-cell halo)
+- **Fused Lax-Friedrichs flux divergence RawKernel** — computes Euler flux evaluation, LF numerical flux combination, and spatial differencing in a single kernel using shared memory for the interface shift, eliminating multiple intermediate arrays
 - **CUB device-wide reductions** via `cuda.compute` (`make_reduce_into` with `OpKind.MAXIMUM`) for max wavespeed computation, with cached reducer and pre-allocated temp storage to avoid per-timestep recompilation

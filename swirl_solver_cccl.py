@@ -234,6 +234,122 @@ def _launch_weno_kernel(kernel, x):
     return left, right
 
 
+# ---------------------------------------------------------------------------
+# Lax-Friedrichs flux divergence fused kernel
+# Fuses: Euler flux eval (left & right) + LF combination + spatial diff
+# into a single kernel.  Uses shared memory (1-element halo per block)
+# so each thread can access the numerical flux at interface j-1.
+# ---------------------------------------------------------------------------
+_LF_KERNEL_SRC = r"""
+#define LF_BLOCK 256
+
+/* ---- Euler physical flux from conservative variables ---- */
+__device__ __forceinline__
+void euler_flux(REAL rho, REAL m, REAL E, REAL gam,
+                REAL* f0, REAL* f1, REAL* f2)
+{
+    REAL u = m / rho;
+    REAL p = (gam - (REAL)1) * (E - (REAL)0.5 * rho * u * u);
+    *f0 = m;
+    *f1 = m * u + p;
+    *f2 = (E + p) * u;
+}
+
+extern "C" __global__
+void laxfriedrichs_flux_divergence_kernel(
+    const REAL* __restrict__ L,          /* left  states [3*Z] row-major */
+    const REAL* __restrict__ R,          /* right states [3*Z]           */
+    REAL*       __restrict__ dUdt,       /* output RHS   [3*Z]           */
+    const REAL* __restrict__ amax_ptr,   /* max wavespeed (1 element)    */
+    const int Z,
+    const REAL inv_dy,
+    const REAL gam)
+{
+    /* shared memory: 3 * (LF_BLOCK + 1) for numerical fluxes + halo */
+    extern __shared__ REAL smem[];
+    const int tid = threadIdx.x;
+    const int g   = blockIdx.x * LF_BLOCK + tid;
+    const REAL amax = amax_ptr[0];
+
+    /* --- compute LF numerical flux at interface g --- */
+    REAL fn0 = (REAL)0, fn1 = (REAL)0, fn2 = (REAL)0;
+    if (g < Z) {
+        REAL Ll0 = L[g], Ll1 = L[Z + g], Ll2 = L[2*Z + g];
+        REAL Rr0 = R[g], Rr1 = R[Z + g], Rr2 = R[2*Z + g];
+        REAL fL0, fL1, fL2, fR0, fR1, fR2;
+        euler_flux(Ll0, Ll1, Ll2, gam, &fL0, &fL1, &fL2);
+        euler_flux(Rr0, Rr1, Rr2, gam, &fR0, &fR1, &fR2);
+        fn0 = (REAL)0.5 * (fL0 + fR0 - amax * (Rr0 - Ll0));
+        fn1 = (REAL)0.5 * (fL1 + fR1 - amax * (Rr1 - Ll1));
+        fn2 = (REAL)0.5 * (fL2 + fR2 - amax * (Rr2 - Ll2));
+    }
+
+    /* store in shared memory (slot tid+1; slot 0 is left halo) */
+    REAL* s0 = smem;
+    REAL* s1 = smem + (LF_BLOCK + 1);
+    REAL* s2 = smem + 2 * (LF_BLOCK + 1);
+    s0[tid + 1] = fn0;
+    s1[tid + 1] = fn1;
+    s2[tid + 1] = fn2;
+
+    /* thread 0 computes left-halo flux at interface (g-1) */
+    if (tid == 0) {
+        int h = g - 1;
+        if (h < 0) h = Z - 1;          /* wrap like cp.concatenate */
+        REAL Ll0 = L[h], Ll1 = L[Z + h], Ll2 = L[2*Z + h];
+        REAL Rr0 = R[h], Rr1 = R[Z + h], Rr2 = R[2*Z + h];
+        REAL fL0, fL1, fL2, fR0, fR1, fR2;
+        euler_flux(Ll0, Ll1, Ll2, gam, &fL0, &fL1, &fL2);
+        euler_flux(Rr0, Rr1, Rr2, gam, &fR0, &fR1, &fR2);
+        s0[0] = (REAL)0.5 * (fL0 + fR0 - amax * (Rr0 - Ll0));
+        s1[0] = (REAL)0.5 * (fL1 + fR1 - amax * (Rr1 - Ll1));
+        s2[0] = (REAL)0.5 * (fL2 + fR2 - amax * (Rr2 - Ll2));
+    }
+
+    __syncthreads();
+
+    /* dUdt = -(F[g] - F[g-1]) / dy */
+    if (g < Z) {
+        dUdt[g]       = -(s0[tid + 1] - s0[tid]) * inv_dy;
+        dUdt[Z + g]   = -(s1[tid + 1] - s1[tid]) * inv_dy;
+        dUdt[2*Z + g] = -(s2[tid + 1] - s2[tid]) * inv_dy;
+    }
+}
+"""
+
+_LF_BLOCK = 256
+_lf_kernel_cache = {}
+
+
+def _get_lf_kernel(dtype):
+    """Compile (or fetch cached) LF divergence kernel for the given dtype."""
+    if dtype not in _lf_kernel_cache:
+        if dtype == cp.float32:
+            src = _LF_KERNEL_SRC.replace('REAL', 'float')
+        else:
+            src = _LF_KERNEL_SRC.replace('REAL', 'double')
+        _lf_kernel_cache[dtype] = cp.RawKernel(
+            src, 'laxfriedrichs_flux_divergence_kernel')
+    return _lf_kernel_cache[dtype]
+
+
+def _launch_lf_divergence(left, right, amax, inv_dy_val):
+    """Fused Lax-Friedrichs flux + spatial divergence.  Returns dUdt[3,Z]."""
+    Z = left.shape[1]
+    dUdt = cp.empty_like(left)
+    kernel = _get_lf_kernel(left.dtype)
+    grid = ((Z + _LF_BLOCK - 1) // _LF_BLOCK,)
+    smem = 3 * (_LF_BLOCK + 1) * left.dtype.itemsize
+    # amax is a CuPy 0-d array; reshape to 1-d so RawKernel passes as pointer
+    amax_arr = amax.reshape(1) if amax.ndim == 0 else amax
+    real_t = np.float32 if left.dtype == cp.float32 else np.float64
+    kernel(grid, (_LF_BLOCK,),
+           (left, right, dUdt, amax_arr, np.int32(Z),
+            real_t(inv_dy_val), real_t(gamma)),
+           shared_mem=smem)
+    return dUdt
+
+
 def flux(x):
     rho = x[0, :]
     m = x[1, :]
@@ -615,6 +731,7 @@ def main():
     def _max_abs(arr):
         return cub_max(arr) if cub_max is not None else cp.max(cp.abs(arr))
 
+    inv_dy = float(1.0 / dy)  # precompute once (dy is constant)
     dt = Co * dy / _max_abs(EigA(u)[0])
 
     if plots:
@@ -642,6 +759,7 @@ def main():
     # Timing event accumulators for per-fold breakdowns
     _weno_events = []
     _reduce_events = []
+    _flux_events = []
 
     # Define L_operator closure once (equivalent to the inlined operator in JAX fori_loop)
     def L_operator(u_state):
@@ -653,13 +771,13 @@ def main():
         re0 = cp.cuda.Event(); re0.record()
         amax = _max_abs(eigval)
         re1 = cp.cuda.Event(); re1.record()
+        fe0 = cp.cuda.Event(); fe0.record()
+        dUdt = _launch_lf_divergence(left, right, amax, inv_dy)
+        fe1 = cp.cuda.Event(); fe1.record()
         _weno_events.append((we0, we1))
         _reduce_events.append((re0, re1))
-        flux_left_right = flux(left)
-        flux_right_right = flux(right)
-        flux_vals = 0.5 * (flux_left_right + flux_right_right - amax * (right - left))
-        flux_shifted = cp.concatenate((flux_vals[:, -1:], flux_vals[:, :-1]), axis=1)
-        df = BC(-(flux_vals - flux_shifted) / dy)
+        _flux_events.append((fe0, fe1))
+        df = BC(dUdt)
         return df
 
     # Warmup (equivalent to JAX JIT pre-compilation step)
@@ -668,6 +786,7 @@ def main():
     cp.cuda.Device().synchronize()
     _weno_events.clear()
     _reduce_events.clear()
+    _flux_events.clear()
     print('Warmup complete. Initiating loop...')
 
     plot_counter = 0
@@ -696,12 +815,15 @@ def main():
 
         weno_ms = sum(cp.cuda.get_elapsed_time(a, b) for a, b in _weno_events)
         reduce_ms = sum(cp.cuda.get_elapsed_time(a, b) for a, b in _reduce_events)
+        flux_ms = sum(cp.cuda.get_elapsed_time(a, b) for a, b in _flux_events)
         _weno_events.clear()
         _reduce_events.clear()
+        _flux_events.clear()
 
         n += fold
         print(f"[{n:04d}] t={t:.3f} Mzps={Z * fold * 1e-6 / elapsed_s:.4f}"
-              f"  weno={weno_ms:.1f}ms  reduce={reduce_ms:.1f}ms  total={elapsed_ms:.1f}ms")
+              f"  weno={weno_ms:.1f}ms  reduce={reduce_ms:.1f}ms"
+              f"  flux={flux_ms:.1f}ms  total={elapsed_ms:.1f}ms")
 
         if plots and plot_counter % plot_interval == 0:
             update_plot(u, t, lines, axes)
