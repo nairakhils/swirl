@@ -27,7 +27,7 @@ import jax
 jax.config.update('jax_enable_x64', precision == '64')
 import jax.numpy as jnp
 
-actual_backend = jax.lib.xla_bridge.get_backend().platform
+actual_backend = jax.default_backend()
 print(f"JAX backend: {actual_backend}")
 from jax import jit, vmap, lax
 import numpy as np
