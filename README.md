@@ -14,7 +14,7 @@ Built as a learning project to explore high-order hydrodynamics methods on moder
 - Real-time matplotlib plotting with dark theme
 - Two backends:
   - **JAX** (`swirl_solver.py`) — XLA-compiled, supports CPU/GPU/Metal/CUDA
-  - **CuPy** (`swirl_solver_cccl.py`) — CUDA-native with fused WENO5 RawKernels using shared-memory tiling
+  - **CuPy** (`swirl_solver_cccl.py`) — CUDA-native with fused WENO5 RawKernels, CUB reductions via `cuda.compute`, and per-fold timing breakdowns
 
 ## Array Layout
 
@@ -40,6 +40,14 @@ pip install cupy-cuda12x numpy matplotlib
 ```
 
 Replace `cupy-cuda12x` with the package matching your CUDA toolkit version (e.g. `cupy-cuda13x`).
+
+Optional — install `cuda-cccl` for CUB device-wide reductions (max wavespeed via `cuda.compute`). The solver falls back to CuPy if unavailable:
+
+```bash
+pip install "cuda-cccl[cu12]"    # match your CUDA toolkit version
+```
+
+`cuda-cccl` requires Python <= 3.13.
 
 ## Usage
 
@@ -91,4 +99,8 @@ JAX-only flags: `--backend` (`cpu`/`gpu`/`metal`/`cuda`/`auto`), `--precision` (
 
 ## Performance
 
-Output reports **Mzps** (million zone-updates per second). The CuPy backend uses fused CUDA RawKernels for WENO5 reconstruction with shared-memory tiling (256 threads/block, 5-cell halo), reducing kernel launch overhead compared to element-wise CuPy operations.
+Output reports **Mzps** (million zone-updates per second) along with per-fold timing breakdowns (WENO kernel, reduction, and total wall time).
+
+The CuPy backend uses:
+- **Fused CUDA RawKernels** for WENO5 reconstruction with shared-memory tiling (256 threads/block, 5-cell halo)
+- **CUB device-wide reductions** via `cuda.compute` (`make_reduce_into` with `OpKind.MAXIMUM`) for max wavespeed computation, with cached reducer and pre-allocated temp storage to avoid per-timestep recompilation

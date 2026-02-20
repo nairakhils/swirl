@@ -13,6 +13,44 @@ plt.style.use('dark_background')
 gamma = 1.4
 
 # ---------------------------------------------------------------------------
+# cuda.compute (CUB) integration for device-wide reductions
+# ---------------------------------------------------------------------------
+try:
+    import cuda.compute as ccl
+    _HAS_CCL = True
+except ImportError:
+    _HAS_CCL = False
+
+
+class _CUBMaxReducer:
+    """Cached CUB MAXIMUM reducer.  Avoids recompilation and temp-storage
+    reallocation on every timestep.  Used for max(|eigenvalues|)."""
+    __slots__ = ('reducer', 'd_out', 'h_init', 'temp', 'n', 'op')
+
+    def __init__(self, n, dtype):
+        self.n = n
+        self.op = ccl.OpKind.MAXIMUM
+        self.d_out = cp.zeros(1, dtype=dtype)
+        self.h_init = np.array(0.0, dtype=np.dtype(dtype))
+        proto = cp.empty(n, dtype=dtype)
+        self.reducer = ccl.make_reduce_into(
+            proto, self.d_out, self.op, self.h_init
+        )
+        temp_bytes = self.reducer(
+            None, proto, self.d_out, self.op, n, self.h_init
+        )
+        self.temp = cp.empty(max(temp_bytes, 1), dtype=cp.uint8)
+
+    def __call__(self, arr):
+        """Return max(|arr.ravel()|) as a CuPy 0-d array (stays on GPU)."""
+        flat = cp.abs(arr).ravel()
+        self.reducer(
+            self.temp, flat, self.d_out, self.op, self.n, self.h_init
+        )
+        return self.d_out[0]
+
+
+# ---------------------------------------------------------------------------
 # WENO5 fused CUDA RawKernels (shared-memory tiled, 256 threads/block)
 # Both JS and Z variants live in a single compilation unit.
 # The source uses REAL / FABS placeholders that are text-replaced per dtype.
@@ -570,7 +608,14 @@ def main():
     Z = Z + 6
     y = cp.linspace(xlims[0] - 2.5 * float(dy), xlims[1] + 2.5 * float(dy), Z)
     u = BC(cellaverage_type(u0, y, dy))
-    dt = Co * dy / cp.max(cp.abs(EigA(u)[0]))
+
+    # Cached cuda.compute CUB max-abs reducer (3 eigenvalue rows × Z cols)
+    cub_max = _CUBMaxReducer(3 * Z, u.dtype) if _HAS_CCL else None
+
+    def _max_abs(arr):
+        return cub_max(arr) if cub_max is not None else cp.max(cp.abs(arr))
+
+    dt = Co * dy / _max_abs(EigA(u)[0])
 
     if plots:
         figure, axes, lines = plot_initial_state(u, y, t, cellaverage_type)
@@ -592,13 +637,24 @@ def main():
         print(f'  Plot interval: {plot_interval}')
     print(f'  Steps per timing: {fold}')
     print(f'  Test case: {args.test}')
+    print(f'  cuda.compute (CUB): {"available" if _HAS_CCL else "not available"}')
+
+    # Timing event accumulators for per-fold breakdowns
+    _weno_events = []
+    _reduce_events = []
 
     # Define L_operator closure once (equivalent to the inlined operator in JAX fori_loop)
     def L_operator(u_state):
         u_bc = BC(u_state)
+        we0 = cp.cuda.Event(); we0.record()
         left, right = slvr(u_bc)
+        we1 = cp.cuda.Event(); we1.record()
         eigval, _ = EigA(u_bc)
-        amax = cp.max(cp.abs(eigval))
+        re0 = cp.cuda.Event(); re0.record()
+        amax = _max_abs(eigval)
+        re1 = cp.cuda.Event(); re1.record()
+        _weno_events.append((we0, we1))
+        _reduce_events.append((re0, re1))
         flux_left_right = flux(left)
         flux_right_right = flux(right)
         flux_vals = 0.5 * (flux_left_right + flux_right_right - amax * (right - left))
@@ -610,6 +666,8 @@ def main():
     print('Warming up CuPy kernels...')
     _ = integ(L_operator, u.copy(), dt)
     cp.cuda.Device().synchronize()
+    _weno_events.clear()
+    _reduce_events.clear()
     print('Warmup complete. Initiating loop...')
 
     plot_counter = 0
@@ -625,7 +683,10 @@ def main():
             u = integ(L_operator, u, dt)
             t = t + float(dt)
             eigval, _ = EigA(u)
-            amax = cp.max(cp.abs(eigval))
+            re0 = cp.cuda.Event(); re0.record()
+            amax = _max_abs(eigval)
+            re1 = cp.cuda.Event(); re1.record()
+            _reduce_events.append((re0, re1))
             dt = Co * dy / amax
 
         end_event.record()
@@ -633,8 +694,14 @@ def main():
         elapsed_ms = cp.cuda.get_elapsed_time(start_event, end_event)
         elapsed_s = elapsed_ms / 1000.0
 
+        weno_ms = sum(cp.cuda.get_elapsed_time(a, b) for a, b in _weno_events)
+        reduce_ms = sum(cp.cuda.get_elapsed_time(a, b) for a, b in _reduce_events)
+        _weno_events.clear()
+        _reduce_events.clear()
+
         n += fold
-        print(f"[{n:04d}] t={t:.3f} Mzps={Z * fold * 1e-6 / elapsed_s:.4f}")
+        print(f"[{n:04d}] t={t:.3f} Mzps={Z * fold * 1e-6 / elapsed_s:.4f}"
+              f"  weno={weno_ms:.1f}ms  reduce={reduce_ms:.1f}ms  total={elapsed_ms:.1f}ms")
 
         if plots and plot_counter % plot_interval == 0:
             update_plot(u, t, lines, axes)
