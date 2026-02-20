@@ -5,6 +5,9 @@ Uses WENO5 reconstruction with Lax-Friedrichs flux splitting.
 Array layout: [3, Z] where row 0=density, 1=momentum, 2=energy.
 """
 import argparse
+import subprocess
+import sys
+import time
 import cupy as cp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -692,7 +695,13 @@ def main():
                       help='Update plot every N iterations (default: 1)')
     parser.add_argument('--fold', type=int, default=20,
                       help='Number of steps per timing measurement (default: 20)')
+    parser.add_argument('--benchmark', action='store_true',
+                      help='Run benchmark: per-component timing, bandwidth, scaling study')
     args = parser.parse_args()
+
+    if args.benchmark:
+        run_benchmark(args)
+        return
 
     print(f"CuPy backend: cuda (device {cp.cuda.runtime.getDevice()})")
 
@@ -858,6 +867,262 @@ def main():
             self.grid_size = Z
             self.dt = dt
     return TestResults()
+
+
+def _run_benchmark_single(Z_interior, solver_name, integrator_name, cfl, n_steps=100):
+    """Run a single benchmark for a given grid size. Returns dict of timings."""
+    slvr = globals()[solver_name]
+    integ = globals()[integrator_name]
+    BC = outflow
+
+    rhoJ = cp.array([1.0, 0.125])
+    uJ = cp.array([0.0, 0.0])
+    pJ = cp.array([1.0, 0.1])
+    u0 = riemann(rhoJ, uJ, pJ)
+    xlims = np.array([-0.5, 0.5])
+
+    dy = abs((xlims[1] - xlims[0]) / (Z_interior + 6))
+    Z = Z_interior + 6
+    y = cp.linspace(xlims[0] - 2.5 * dy, xlims[1] + 2.5 * dy, Z)
+    u = BC(cellaverage(u0, y, dy))
+
+    cub_max = _CUBMaxReducer(3 * Z, u.dtype) if _HAS_CCL else None
+    def _max_abs(arr):
+        return cub_max(arr) if cub_max is not None else cp.max(cp.abs(arr))
+
+    inv_dy = float(1.0 / dy)
+    dt = cfl * dy / _max_abs(EigA(u)[0])
+
+    # Event lists for each component (non-overlapping atomic pieces)
+    bc_events, weno_events, eig_events = [], [], []
+    reduce_events, flux_events = [], []
+
+    def L_operator_bench(u_state):
+        be0 = cp.cuda.Event(); be0.record()
+        u_bc = BC(u_state)
+        be1 = cp.cuda.Event(); be1.record()
+        bc_events.append((be0, be1))
+
+        we0 = cp.cuda.Event(); we0.record()
+        left, right = slvr(u_bc)
+        we1 = cp.cuda.Event(); we1.record()
+        weno_events.append((we0, we1))
+
+        ee0 = cp.cuda.Event(); ee0.record()
+        eigval, _ = EigA(u_bc)
+        ee1 = cp.cuda.Event(); ee1.record()
+        eig_events.append((ee0, ee1))
+
+        re0 = cp.cuda.Event(); re0.record()
+        amax = _max_abs(eigval)
+        re1 = cp.cuda.Event(); re1.record()
+        reduce_events.append((re0, re1))
+
+        fe0 = cp.cuda.Event(); fe0.record()
+        dUdt = _launch_lf_divergence(left, right, amax, inv_dy)
+        fe1 = cp.cuda.Event(); fe1.record()
+        flux_events.append((fe0, fe1))
+
+        be2 = cp.cuda.Event(); be2.record()
+        df = BC(dUdt)
+        be3 = cp.cuda.Event(); be3.record()
+        bc_events.append((be2, be3))
+        return df
+
+    # Warmup
+    _ = integ(L_operator_bench, u.copy(), dt)
+    cp.cuda.Device().synchronize()
+    bc_events.clear(); weno_events.clear(); eig_events.clear()
+    reduce_events.clear(); flux_events.clear()
+
+    # Timed run
+    cp.cuda.Device().synchronize()
+    wall_start = time.perf_counter()
+    total_e0 = cp.cuda.Event(); total_e0.record()
+
+    for _ in range(n_steps):
+        u = integ(L_operator_bench, u, dt)
+
+        ee0 = cp.cuda.Event(); ee0.record()
+        eigval, _ = EigA(u)
+        ee1 = cp.cuda.Event(); ee1.record()
+        eig_events.append((ee0, ee1))
+
+        re0 = cp.cuda.Event(); re0.record()
+        amax = _max_abs(eigval)
+        re1 = cp.cuda.Event(); re1.record()
+        reduce_events.append((re0, re1))
+        dt = cfl * dy / amax
+
+    total_e1 = cp.cuda.Event(); total_e1.record()
+    total_e1.synchronize()
+    wall_elapsed = time.perf_counter() - wall_start
+
+    def sum_ms(evts):
+        return sum(cp.cuda.get_elapsed_time(a, b) for a, b in evts) if evts else 0.0
+
+    bc_ms = sum_ms(bc_events)
+    weno_ms = sum_ms(weno_events)
+    eig_ms = sum_ms(eig_events)
+    reduce_ms = sum_ms(reduce_events)
+    flux_ms = sum_ms(flux_events)
+    total_gpu_ms = cp.cuda.get_elapsed_time(total_e0, total_e1)
+
+    # Bandwidth calculations (bytes per step)
+    elem = 4  # float32
+    # WENO: reads [3,Z], writes 2x[3,Z]
+    weno_bytes = (3 * Z * elem) + 2 * (3 * Z * elem)
+    # LF flux: reads 2x[3,Z] + 1 scalar, writes [3,Z]
+    lf_bytes = 2 * (3 * Z * elem) + (3 * Z * elem)
+    # Reduce: reads [3,Z], writes 1 scalar
+    reduce_bytes = 3 * Z * elem
+
+    # L_operator calls per RK step: RK1=1, RK3=3, RK4=4
+    rk_calls = {'RK1': 1, 'RK3': 3, 'RK4': 4}.get(integrator_name, 1)
+
+    return {
+        'Z': Z, 'n_steps': n_steps, 'rk_calls': rk_calls,
+        'bc_ms': bc_ms, 'weno_ms': weno_ms, 'eig_ms': eig_ms,
+        'reduce_ms': reduce_ms, 'flux_ms': flux_ms,
+        'total_gpu_ms': total_gpu_ms, 'wall_s': wall_elapsed,
+        'weno_bytes': weno_bytes, 'lf_bytes': lf_bytes, 'reduce_bytes': reduce_bytes,
+    }
+
+
+def _print_benchmark_report(results):
+    """Print formatted benchmark report for a single grid size."""
+    Z = results['Z']
+    N = results['n_steps']
+    total = results['total_gpu_ms']
+    rk_calls = results['rk_calls']
+
+    components = [
+        ('BC (outflow)',   results['bc_ms']),
+        ('WENO5 kernel',   results['weno_ms']),
+        ('EigA compute',   results['eig_ms']),
+        ('Max reduce',     results['reduce_ms']),
+        ('LF flux div',    results['flux_ms']),
+    ]
+    accounted = sum(v for _, v in components)
+    overhead = total - accounted
+
+    print(f"\n{'='*65}")
+    print(f"  Grid Z={Z}  |  {N} steps (RK×{rk_calls})  |  GPU: {total:.2f} ms")
+    print(f"{'='*65}")
+    print(f"  {'Component':<18} {'Total ms':>10} {'Avg us/step':>12} {'%':>7}")
+    print(f"  {'-'*50}")
+    for name, ms in components:
+        pct = 100 * ms / total if total > 0 else 0
+        print(f"  {name:<18} {ms:>10.2f} {ms*1000/N:>12.1f} {pct:>6.1f}%")
+    pct_oh = 100 * overhead / total if total > 0 else 0
+    print(f"  {'RK arith + Python':<18} {overhead:>10.2f} {overhead*1000/N:>12.1f} {pct_oh:>6.1f}%")
+
+    # Bandwidth — account for RK calls per step
+    print(f"\n  Effective bandwidth (GB/s):")
+    weno_ms = results['weno_ms']
+    flux_ms = results['flux_ms']
+    reduce_ms = results['reduce_ms']
+    n_L_calls = N * rk_calls  # total L_operator invocations
+    if weno_ms > 0:
+        weno_bw = results['weno_bytes'] * n_L_calls / (weno_ms * 1e-3) / 1e9
+        print(f"    WENO5:   {weno_bw:>8.1f} GB/s")
+    if flux_ms > 0:
+        lf_bw = results['lf_bytes'] * n_L_calls / (flux_ms * 1e-3) / 1e9
+        print(f"    LF flux: {lf_bw:>8.1f} GB/s")
+    if reduce_ms > 0:
+        # reduce: n_L_calls inside L_operator + N for dt update
+        n_reduces = n_L_calls + N
+        red_bw = results['reduce_bytes'] * n_reduces / (reduce_ms * 1e-3) / 1e9
+        print(f"    Reduce:  {red_bw:>8.1f} GB/s")
+
+    mzps = Z * N * 1e-6 / (total * 1e-3)
+    print(f"\n  Mzps: {mzps:.2f}")
+    return mzps
+
+
+def run_benchmark(args):
+    """Full benchmark: per-component timing, scaling study, optional JAX comparison."""
+    print("=" * 65)
+    print("  SWIRL BENCHMARK — CuPy/CUDA Backend")
+    print("=" * 65)
+
+    dev = cp.cuda.Device()
+    props = cp.cuda.runtime.getDeviceProperties(dev.id)
+    print(f"  GPU: {props['name'].decode()}")
+    print(f"  cuda.compute (CUB): {'available' if _HAS_CCL else 'not available'}")
+    print(f"  Solver: {args.solver}  |  Integrator: {args.integrator}  |  CFL: {args.cfl}")
+
+    grid_sizes = [1000, 5000, 10000, 50000, 100000]
+    all_results = []
+
+    for gz in grid_sizes:
+        print(f"\n>>> Benchmarking grid size {gz} ...")
+        r = _run_benchmark_single(gz, args.solver, args.integrator, args.cfl, n_steps=100)
+        all_results.append(r)
+        _print_benchmark_report(r)
+
+    # Scaling summary table
+    print(f"\n{'='*65}")
+    print(f"  SCALING SUMMARY")
+    print(f"{'='*65}")
+    print(f"  {'Grid':>8} {'Total ms':>10} {'Mzps':>10} {'us/step':>10} {'WENO%':>7} {'LF%':>7} {'Red%':>7}")
+    print(f"  {'-'*62}")
+    for r in all_results:
+        Z = r['Z']
+        N = r['n_steps']
+        t = r['total_gpu_ms']
+        mzps = Z * N * 1e-6 / (t * 1e-3) if t > 0 else 0
+        w_pct = 100 * r['weno_ms'] / t if t > 0 else 0
+        f_pct = 100 * r['flux_ms'] / t if t > 0 else 0
+        r_pct = 100 * r['reduce_ms'] / t if t > 0 else 0
+        print(f"  {Z:>8} {t:>10.2f} {mzps:>10.2f} {t*1000/N:>10.1f} {w_pct:>6.1f}% {f_pct:>6.1f}% {r_pct:>6.1f}%")
+
+    # JAX comparison
+    print(f"\n{'='*65}")
+    print(f"  JAX COMPARISON (grid=5000, 100 steps)")
+    print(f"{'='*65}")
+    try:
+        import os, shutil
+        # Prefer system python for JAX (may not be in CuPy venv)
+        py_candidates = [shutil.which('python3'), shutil.which('python')]
+        py_candidates = [p for p in py_candidates if p]
+        if not py_candidates:
+            py_candidates = [sys.executable]
+        solver_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'swirl_solver.py')
+        # Try cuda first, then gpu, then cpu
+        jax_ran = False
+        for backend in ['cuda', 'gpu', 'cpu']:
+            env = os.environ.copy()
+            if backend in ('cuda', 'gpu'):
+                env['JAX_PLATFORMS'] = backend
+            jax_cmd = [
+                py_candidates[0], solver_path,
+                '--backend', backend, '--no-plot', '--grid-size', '5000',
+                '--solver', args.solver, '--integrator', args.integrator,
+                '--cfl', str(args.cfl), '--fold', '100',
+            ]
+            print(f"  Trying: {' '.join(jax_cmd[-10:])}")
+            result = subprocess.run(jax_cmd, capture_output=True, text=True,
+                                    timeout=120, env=env)
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if 'Mzps' in line:
+                        print(f"  JAX ({backend}): {line.strip()}")
+                cupy_r = next((r for r in all_results if r['Z'] == 5006), None)
+                if cupy_r:
+                    cupy_mzps = cupy_r['Z'] * cupy_r['n_steps'] * 1e-6 / (cupy_r['total_gpu_ms'] * 1e-3)
+                    print(f"  CuPy fused: {cupy_mzps:.2f} Mzps")
+                jax_ran = True
+                break
+        if not jax_ran:
+            print(f"  JAX solver unavailable (tried cuda/gpu/cpu)")
+    except FileNotFoundError:
+        print("  JAX solver not found (swirl_solver.py)")
+    except subprocess.TimeoutExpired:
+        print("  JAX solver timed out (120s)")
+    except Exception as e:
+        print(f"  JAX comparison error: {e}")
 
 
 if __name__ == '__main__':
